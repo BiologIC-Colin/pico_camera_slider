@@ -10,6 +10,11 @@ project(slider)
 # App sources
 target_sources(app PRIVATE
         src/main.c
+        src/wifi_scanner.c
+        src/wifi_ap_provisioning.c
+        src/http_server.c
+        src/wifi_config_gui.c
+        src/wifi_shell_commands.c
 )
 
 # If you keep headers in src/ (e.g., wifi_creds.h), this is optional because

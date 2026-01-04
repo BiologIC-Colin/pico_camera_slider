@@ -1,12 +1,16 @@
 /*
- * WiFi Settings Demo for Raspberry Pi Pico W
+ * WiFi Configuration System for Raspberry Pi Pico W
  *
- * Demonstrates persistent storage using Zephyr Settings API with ZMS backend.
+ * Demonstrates comprehensive WiFi management using Zephyr Settings API with ZMS backend.
  *
  * Features:
  * - Boot counter that increments on each reboot
  * - WiFi credential storage (SSID and password)
  * - Automatic WiFi connection on boot if credentials are stored
+ * - WiFi network scanning
+ * - AP provisioning mode with HTTP configuration interface
+ * - GUI framework for display-based configuration
+ * - Extended shell commands for management
  * - Persistent storage survives power cycles
  *
  * Shell Commands:
@@ -14,6 +18,9 @@
  *   wifi set_password <pass>  - Store WiFi password
  *   wifi connect              - Connect to WiFi using stored credentials
  *   wifi status               - Show WiFi connection status
+ *   wifi_ext reset            - Clear stored WiFi credentials
+ *   wifi_ext scan             - Scan for available networks
+ *   wifi_ext provision        - Start AP provisioning mode
  *   demo show                 - Display current settings
  *   kernel reboot             - Reboot to test persistence
  */
@@ -28,7 +35,15 @@
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/net/net_ip.h>
 #include <string.h>
+
+/* WiFi configuration modules */
+#include "wifi_scanner.h"
+#include "wifi_ap_provisioning.h"
+#include "http_server.h"
+#include "wifi_config_gui.h"
+#include "wifi_shell_commands.h"
 
 #define STORAGE_PARTITION_ID FIXED_PARTITION_ID(storage_partition)
 
@@ -46,6 +61,18 @@ static bool wifi_credentials_set = false;
 static struct net_mgmt_event_callback wifi_cb;
 static bool wifi_connected = false;
 static K_SEM_DEFINE(wifi_connected_sem, 0, 1);
+
+/* WiFi configuration system components */
+static struct wifi_scanner scanner;
+static struct wifi_ap_provisioning ap_prov;
+static struct http_server http_srv;
+static bool provisioning_mode = false;
+
+/* Forward declarations */
+static void provisioning_creds_received(const char *ssid,
+                                         const char *password,
+                                         void *user_data);
+static void start_http_server(void);
 
 /*
  * Settings handler: Set (called when loading from storage)
@@ -138,7 +165,7 @@ SETTINGS_STATIC_HANDLER_DEFINE(demo_handler, "demo",
  * WiFi event handler
  */
 static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
-                                    uint32_t mgmt_event, struct net_if *iface)
+                                    uint64_t mgmt_event, struct net_if *iface)
 {
     const struct wifi_status *status = (const struct wifi_status *)cb->info;
 
@@ -267,6 +294,63 @@ static int cmd_wifi_set_password(const struct shell *sh, size_t argc, char **arg
 }
 
 /*
+ * Start HTTP configuration server
+ */
+static void start_http_server(void)
+{
+    int rc;
+
+    /* Check if already running */
+    if (http_srv.state == HTTP_SERVER_RUNNING) {
+        printk("HTTP server already running\n");
+        return;
+    }
+
+    /* Wait for DHCP to complete and get IP address */
+    printk("Waiting for IP address...\n");
+    k_msleep(3000);
+
+    /* Start HTTP server for web configuration interface */
+    printk("Starting HTTP configuration server...\n");
+
+    /* Initialize WiFi scanner if not already done */
+    if (scanner.state == WIFI_SCANNER_IDLE) {
+        rc = wifi_scanner_init(&scanner);
+        if (rc) {
+            printk("Warning: WiFi scanner init failed: %d\n", rc);
+        }
+    }
+
+    /* Initialize HTTP server */
+    rc = http_server_init(&http_srv, &scanner);
+    if (rc == 0) {
+        rc = http_server_start(&http_srv, provisioning_creds_received, NULL);
+        if (rc == 0) {
+            struct net_if *iface = net_if_get_default();
+            if (iface && iface->config.ip.ipv4 &&
+                iface->config.ip.ipv4->unicast[0].ipv4.addr_state == NET_ADDR_PREFERRED) {
+                struct in_addr *addr = &iface->config.ip.ipv4->unicast[0].ipv4.address.in_addr;
+                printk("\n");
+                printk("===========================================\n");
+                printk("  WiFi Configuration Interface Ready\n");
+                printk("===========================================\n");
+                printk("  Open browser to: http://%d.%d.%d.%d\n",
+                       addr->s4_addr[0], addr->s4_addr[1],
+                       addr->s4_addr[2], addr->s4_addr[3]);
+                printk("===========================================\n\n");
+            } else {
+                printk("HTTP server started (waiting for IP address)\n");
+                printk("Use 'net iface' to check IP address\n");
+            }
+        } else {
+            printk("Warning: Failed to start HTTP server: %d\n", rc);
+        }
+    } else {
+        printk("Warning: Failed to init HTTP server: %d\n", rc);
+    }
+}
+
+/*
  * Shell command: connect to WiFi
  */
 static int cmd_wifi_connect(const struct shell *sh, size_t argc, char **argv)
@@ -278,6 +362,47 @@ static int cmd_wifi_connect(const struct shell *sh, size_t argc, char **argv)
     }
 
     shell_print(sh, "WiFi connected successfully");
+
+    /* Start HTTP server after successful connection */
+    start_http_server();
+
+    return 0;
+}
+
+/*
+ * Shell command: reset WiFi credentials
+ */
+static int cmd_wifi_reset(const struct shell *sh, size_t argc, char **argv)
+{
+    int rc;
+
+    shell_print(sh, "Resetting WiFi credentials...");
+
+    /* Clear in-memory variables */
+    memset(wifi_ssid, 0, sizeof(wifi_ssid));
+    memset(wifi_psk, 0, sizeof(wifi_psk));
+    wifi_credentials_set = false;
+
+    /* Delete from persistent storage */
+    rc = settings_delete("demo/wifi_ssid");
+    if (rc && rc != -ENOENT) {
+        shell_error(sh, "Failed to delete SSID: %d", rc);
+    }
+
+    rc = settings_delete("demo/wifi_psk");
+    if (rc && rc != -ENOENT) {
+        shell_error(sh, "Failed to delete password: %d", rc);
+    }
+
+    /* Save to persist deletion */
+    rc = settings_save();
+    if (rc) {
+        shell_error(sh, "Failed to save: %d", rc);
+        return rc;
+    }
+
+    shell_print(sh, "WiFi credentials cleared successfully");
+    shell_print(sh, "Device will enter provisioning mode on next boot");
     return 0;
 }
 
@@ -311,6 +436,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(wifi_cmds,
     SHELL_CMD(set_ssid, NULL, "Set WiFi SSID", cmd_wifi_set_ssid),
     SHELL_CMD(set_password, NULL, "Set WiFi password", cmd_wifi_set_password),
     SHELL_CMD(connect, NULL, "Connect to WiFi", cmd_wifi_connect),
+    SHELL_CMD(reset, NULL, "Clear WiFi credentials", cmd_wifi_reset),
     SHELL_CMD(status, NULL, "Show WiFi status", cmd_wifi_status),
     SHELL_SUBCMD_SET_END
 );
@@ -324,6 +450,144 @@ SHELL_STATIC_SUBCMD_SET_CREATE(demo_cmds,
 );
 
 SHELL_CMD_REGISTER(demo, &demo_cmds, "Settings demo commands", NULL);
+
+/*
+ * Provisioning credentials callback
+ *
+ * Called when user submits WiFi credentials via AP provisioning interface
+ */
+static void provisioning_creds_received(const char *ssid,
+                                         const char *password,
+                                         void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	printk("\n=== New WiFi Credentials Received ===\n");
+	printk("SSID: %s\n", ssid);
+	printk("Password: ***\n");
+
+	/* Store new credentials */
+	if (strlen(ssid) <= WIFI_SSID_MAX) {
+		strncpy(wifi_ssid, ssid, WIFI_SSID_MAX);
+		wifi_ssid[WIFI_SSID_MAX] = '\0';
+	}
+
+	if (strlen(password) <= WIFI_PSK_MAX) {
+		strncpy(wifi_psk, password, WIFI_PSK_MAX);
+		wifi_psk[WIFI_PSK_MAX] = '\0';
+		wifi_credentials_set = true;
+	}
+
+	/* Save to flash */
+	int rc = settings_save();
+	if (rc) {
+		printk("Warning: Failed to save credentials: %d\n", rc);
+	} else {
+		printk("Credentials saved to flash\n");
+	}
+
+	/* Stop provisioning mode */
+	printk("Stopping provisioning mode...\n");
+	http_server_stop(&http_srv);
+	wifi_ap_provisioning_stop(&ap_prov);
+	provisioning_mode = false;
+
+	/* Wait for AP to fully stop before attempting station mode */
+	printk("Waiting for AP to shut down...\n");
+	k_msleep(2000);
+
+	/* Try to connect to new network */
+	printk("Attempting to connect to new network...\n");
+	wifi_connect_stored();
+}
+
+/*
+ * Start AP provisioning mode
+ *
+ * Creates an access point and HTTP server for WiFi configuration
+ */
+static int start_provisioning_mode(void)
+{
+	int rc;
+
+	if (provisioning_mode) {
+		printk("Already in provisioning mode\n");
+		return 0;
+	}
+
+	printk("\n=== Entering Provisioning Mode ===\n");
+
+	/* Initialize WiFi scanner */
+	rc = wifi_scanner_init(&scanner);
+	if (rc) {
+		printk("ERROR: WiFi scanner init failed: %d\n", rc);
+		return rc;
+	}
+
+	/* Scan for networks to show in web interface */
+	printk("Scanning for WiFi networks...\n");
+	rc = wifi_scanner_scan(&scanner, 10000);
+	if (rc) {
+		printk("Warning: WiFi scan failed: %d\n", rc);
+	} else {
+		size_t count;
+		wifi_scanner_get_results(&scanner, &count);
+		printk("Found %zu networks\n", count);
+	}
+
+	/* Initialize HTTP server */
+	rc = http_server_init(&http_srv, &scanner);
+	if (rc) {
+		printk("ERROR: HTTP server init failed: %d\n", rc);
+		return rc;
+	}
+
+	/* Initialize AP provisioning */
+	rc = wifi_ap_provisioning_init(&ap_prov, NULL);
+	if (rc) {
+		printk("ERROR: AP provisioning init failed: %d\n", rc);
+		return rc;
+	}
+
+	/* Note: AP mode support on Pico W is limited in Zephyr.
+	 * For now, provisioning via serial shell is the primary method.
+	 * Future: Add BLE provisioning or use external AP hardware.
+	 */
+
+	/* Start AP - may not be fully supported on CYW43439 */
+	rc = wifi_ap_provisioning_start(&ap_prov, provisioning_creds_received, NULL);
+	if (rc) {
+		printk("WARNING: AP mode not available: %d\n", rc);
+		printk("Use shell commands for WiFi configuration:\n");
+		printk("  wifi set_ssid <ssid>\n");
+		printk("  wifi set_password <pass>\n");
+		printk("  wifi connect\n");
+		/* Don't fail - allow shell configuration */
+		provisioning_mode = false;
+		return 0;
+	}
+
+	/* Start HTTP server */
+	rc = http_server_start(&http_srv, provisioning_creds_received, NULL);
+	if (rc) {
+		printk("ERROR: Failed to start HTTP server: %d\n", rc);
+		wifi_ap_provisioning_stop(&ap_prov);
+		return rc;
+	}
+
+	provisioning_mode = true;
+
+	printk("\n");
+	printk("===========================================\n");
+	printk("  WiFi Provisioning Mode Active\n");
+	printk("===========================================\n");
+	printk("1. Connect to WiFi network: %s\n", WIFI_AP_DEFAULT_SSID);
+	printk("2. Open browser to: http://%s\n", WIFI_AP_DEFAULT_IP);
+	printk("3. Select your WiFi network and enter password\n");
+	printk("===========================================\n\n");
+
+	return 0;
+}
 
 /*
  * Main application
@@ -383,17 +647,33 @@ int main(void)
                                  NET_EVENT_WIFI_DISCONNECT_RESULT);
     net_mgmt_add_event_callback(&wifi_cb);
 
+    /* Initialize extended WiFi shell commands */
+    wifi_shell_commands_init(&scanner, &ap_prov);
+
     /* Auto-connect to WiFi if credentials are stored */
     if (strlen(wifi_ssid) > 0 && wifi_credentials_set) {
         printk("\nAuto-connecting to WiFi...\n");
+
+        /* Wait for WiFi subsystem to be fully ready */
+        k_msleep(2000);
+
         rc = wifi_connect_stored();
         if (rc == 0) {
             printk("Auto-connect successful\n");
+            start_http_server();
         } else {
             printk("Auto-connect failed (use 'wifi connect' to retry)\n");
         }
     } else {
-        printk("\nNo WiFi credentials stored. Use 'wifi set_ssid' and 'wifi set_password'.\n");
+        printk("\nNo WiFi credentials stored.\n");
+        printk("Entering AP provisioning mode...\n");
+
+        /* Start provisioning mode if no credentials */
+        rc = start_provisioning_mode();
+        if (rc) {
+            printk("ERROR: Failed to start provisioning mode: %d\n", rc);
+            printk("Use shell commands to configure WiFi manually\n");
+        }
     }
 
     /* Display available commands */
@@ -402,6 +682,9 @@ int main(void)
     printk("  wifi set_password <pass>  - Store WiFi password\n");
     printk("  wifi connect              - Connect to WiFi\n");
     printk("  wifi status               - Show WiFi status\n");
+    printk("  wifi_ext reset            - Clear WiFi credentials\n");
+    printk("  wifi_ext scan             - Scan for networks\n");
+    printk("  wifi_ext provision        - Start provisioning mode\n");
     printk("  demo show                 - Show all settings\n");
     printk("  kernel reboot             - Test persistence\n\n");
 
