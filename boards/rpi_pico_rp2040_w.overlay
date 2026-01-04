@@ -6,9 +6,16 @@
 
 &flash0 {
 	partitions {
+		/* Shrink code partition to make room for storage */
+		code_partition: partition@100 {
+			label = "code-partition";
+			reg = <0x00000100 0x001eff00>;  /* Code: 256B to 1.937MB */
+		};
+
+		/* Storage partition at the end */
 		storage_partition: partition@1f0000 {
 			label = "storage";
-			reg = <0x001f0000 0x00010000>;
+			reg = <0x001f0000 0x00010000>;  /* Storage: last 64KB */
 		};
 	};
 };
