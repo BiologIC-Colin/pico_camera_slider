@@ -1,8 +1,32 @@
 # WiFi Configuration System for Slider Application
 
+## Quick Start Guide
+
+### First Time Setup (AP Provisioning Mode)
+
+When the device has no stored WiFi credentials, it automatically enters AP provisioning mode:
+
+1. **Connect to the WiFi access point** named `PicoW-Setup`
+2. **Configure manual IP** on your device (phone/laptop):
+   - IP Address: `192.168.4.50`
+   - Subnet Mask: `255.255.255.0`
+   - Router: `192.168.4.1`
+3. **Open web browser** to `http://192.168.4.1`
+4. **Select your WiFi network** and enter the password
+5. **Submit** - Credentials are saved and device connects to your network
+
+**Note:** Manual IP configuration is required because DHCP server is not supported on the Pico W's CYW43439 WiFi chip in AP mode. This is a one-time setup.
+
+### After Configuration
+
+- Device auto-connects to your WiFi on boot
+- HTTP configuration interface available at device's IP address
+- IP address displayed in serial console
+- Use `wifi reset` command to clear credentials and return to AP mode
+
 ## Overview
 
-This application now includes a comprehensive WiFi configuration system with the following components:
+This application includes a comprehensive WiFi configuration system with the following components:
 
 ### Modules Created
 
